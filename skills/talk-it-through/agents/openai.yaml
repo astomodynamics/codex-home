@@ -1,0 +1,4 @@
+interface:
+  display_name: "Talk It Through"
+  short_description: "Talk through questions without coding"
+  default_prompt: "Use $talk-it-through to answer this in chat without editing files."
