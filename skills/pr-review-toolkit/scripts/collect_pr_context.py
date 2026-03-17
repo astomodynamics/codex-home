@@ -10,6 +10,14 @@ import sys
 from collections import Counter
 from pathlib import Path
 
+COMMON_DEFAULT_BRANCH_NAMES = (
+    "main",
+    "master",
+    "trunk",
+    "develop",
+    "development",
+)
+
 
 def run_git(repo_root: Path, args: list[str], check: bool = True) -> str:
     result = subprocess.run(
@@ -40,20 +48,110 @@ def ref_exists(repo_root: Path, ref: str) -> bool:
     return try_git(repo_root, ["rev-parse", "--verify", ref]) is not None
 
 
+def current_branch_name(repo_root: Path) -> str | None:
+    branch = try_git(repo_root, ["rev-parse", "--abbrev-ref", "HEAD"])
+    if branch and branch != "HEAD":
+        return branch
+    return None
+
+
+def list_refs(repo_root: Path, *prefixes: str) -> list[str]:
+    output = run_git(repo_root, ["for-each-ref", "--format=%(refname:short)", *prefixes], check=False)
+    return [line for line in output.splitlines() if line.strip()]
+
+
+def dedupe_refs(refs: list[str]) -> list[str]:
+    return list(dict.fromkeys(refs))
+
+
+def configured_branch_remote(repo_root: Path, branch: str | None) -> str | None:
+    if not branch:
+        return None
+    return try_git(repo_root, ["config", "--get", f"branch.{branch}.remote"])
+
+
+def resolve_remote_default_branch(repo_root: Path, remote: str) -> str | None:
+    ref = try_git(repo_root, ["symbolic-ref", "--quiet", f"refs/remotes/{remote}/HEAD"])
+    if ref:
+        return ref.removeprefix("refs/remotes/")
+    return None
+
+
+def resolve_any_remote_default_branch(repo_root: Path) -> str | None:
+    output = run_git(
+        repo_root,
+        ["for-each-ref", "--format=%(symref:short)", "refs/remotes/*/HEAD"],
+        check=False,
+    )
+    refs = [line.strip() for line in output.splitlines() if line.strip()]
+    refs = dedupe_refs(refs)
+    if len(refs) == 1:
+        return refs[0]
+    return None
+
+
+def candidate_base_refs(repo_root: Path, remotes: list[str], branch_names: list[str]) -> list[str]:
+    refs: list[str] = []
+    for remote in remotes:
+        refs.extend(f"{remote}/{name}" for name in branch_names)
+    refs.extend(branch_names)
+    return [ref for ref in dedupe_refs(refs) if ref_exists(repo_root, ref)]
+
+
+def resolve_single_branch_fallback(repo_root: Path, current_branch: str | None) -> str | None:
+    excluded = {"HEAD"}
+    if current_branch:
+        excluded.add(current_branch)
+        excluded.add(f"origin/{current_branch}")
+
+    candidates = [
+        ref
+        for ref in list_refs(repo_root, "refs/heads", "refs/remotes")
+        if ref not in excluded and not ref.endswith("/HEAD")
+    ]
+    candidates = dedupe_refs(candidates)
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
 def resolve_auto_base(repo_root: Path) -> str:
-    origin_head = try_git(repo_root, ["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"])
-    if origin_head:
-        return origin_head.removeprefix("refs/remotes/")
+    current_branch = current_branch_name(repo_root)
+    preferred_remotes: list[str] = []
 
-    for candidate in ("origin/main", "origin/master", "main", "master"):
-        if ref_exists(repo_root, candidate):
-            return candidate
+    branch_remote = configured_branch_remote(repo_root, current_branch)
+    if branch_remote:
+        preferred_remotes.append(branch_remote)
+    if "origin" not in preferred_remotes:
+        preferred_remotes.append("origin")
 
-    current_branch = try_git(repo_root, ["rev-parse", "--abbrev-ref", "HEAD"])
-    if current_branch and current_branch != "HEAD":
-        return f"{current_branch}~1"
+    for remote in preferred_remotes:
+        remote_default = resolve_remote_default_branch(repo_root, remote)
+        if remote_default:
+            return remote_default
 
-    return "HEAD~1"
+    configured_default = try_git(repo_root, ["config", "--get", "init.defaultBranch"])
+    branch_name_candidates: list[str] = []
+    if configured_default:
+        branch_name_candidates.append(configured_default)
+
+    branch_name_candidates.extend(COMMON_DEFAULT_BRANCH_NAMES)
+    named_candidates = candidate_base_refs(repo_root, preferred_remotes, branch_name_candidates)
+    if named_candidates:
+        return named_candidates[0]
+
+    remote_default = resolve_any_remote_default_branch(repo_root)
+    if remote_default:
+        return remote_default
+
+    single_branch_fallback = resolve_single_branch_fallback(repo_root, current_branch)
+    if single_branch_fallback:
+        return single_branch_fallback
+
+    if not ref_exists(repo_root, "HEAD~1"):
+        return "HEAD"
+
+    raise RuntimeError("could not auto-detect a default base branch; pass --base explicitly")
 
 
 def parse_name_status(output: str) -> list[dict[str, object]]:
@@ -153,10 +251,14 @@ def is_public_api_path(path: str) -> bool:
 
 def normalize_test_stem(path: str) -> str:
     stem = Path(path).stem.lower()
-    if stem.startswith("test_"):
-        stem = stem[5:]
-    if stem.endswith("_test"):
-        stem = stem[:-5]
+    for prefix in ("test_", "spec_"):
+        if stem.startswith(prefix):
+            stem = stem[len(prefix) :]
+            break
+    for suffix in ("_test", "_spec", ".test", ".spec", "-test", "-spec"):
+        if stem.endswith(suffix):
+            stem = stem[: -len(suffix)]
+            break
     return stem
 
 
@@ -164,13 +266,7 @@ def matches_test(source_path: str, test_path: str) -> bool:
     source = Path(source_path)
     source_stem = source.stem.lower()
     test_stem = normalize_test_stem(test_path)
-    if source_stem and (
-        source_stem == test_stem or source_stem in test_stem or test_stem in source_stem
-    ):
-        return True
-
-    parent_name = source.parent.name.lower()
-    return bool(parent_name and parent_name in test_path.lower())
+    return bool(source_stem and source_stem == test_stem)
 
 
 def build_test_signals(changed_files: list[dict[str, object]]) -> tuple[list[str], list[str]]:
@@ -240,13 +336,46 @@ def collect_commits(repo_root: Path, commit_range: str, limit: int) -> list[dict
     return commits
 
 
+def resolve_range_commit_spec(repo_root: Path, base_ref: str, head_ref: str) -> tuple[str, str]:
+    if base_ref == head_ref == "HEAD" and not ref_exists(repo_root, "HEAD~1"):
+        return head_ref, head_ref
+
+    merge_base = run_git(repo_root, ["merge-base", base_ref, head_ref])
+    return merge_base, f"{merge_base}..{head_ref}"
+
+
 def diff_arguments(mode: str, diff_spec: str | None) -> list[str]:
     if mode == "range":
         assert diff_spec is not None
+        if ".." not in diff_spec:
+            return ["diff-tree", "--root", "--no-commit-id", "-r", diff_spec]
         return ["diff", diff_spec]
     if mode == "staged":
         return ["diff", "--cached"]
     return ["diff"]
+
+
+def collect_untracked_files(repo_root: Path) -> list[str]:
+    output = run_git(repo_root, ["ls-files", "--others", "--exclude-standard"], check=False)
+    return [line for line in output.splitlines() if line.strip()]
+
+
+def count_text_lines(contents: bytes) -> int:
+    if not contents:
+        return 0
+    return contents.count(b"\n") + (0 if contents.endswith(b"\n") else 1)
+
+
+def collect_untracked_numstat(repo_root: Path, path: str) -> tuple[int | None, int | None]:
+    file_path = repo_root / path
+    try:
+        contents = file_path.read_bytes()
+    except OSError:
+        return None, None
+
+    if b"\0" in contents:
+        return None, None
+    return count_text_lines(contents), 0
 
 
 def collect_changed_files(
@@ -269,6 +398,23 @@ def collect_changed_files(
         entry["additions"] = None
         entry["deletions"] = None
         entry["category"] = categorize_path(str(entry["path"]))
+
+    if mode == "working-tree":
+        tracked_paths = {str(entry["path"]) for entry in changed_files}
+        for path in collect_untracked_files(repo_root):
+            if path in tracked_paths:
+                continue
+            additions, deletions = collect_untracked_numstat(repo_root, path)
+            changed_files.append(
+                {
+                    "status": "?",
+                    "status_code": "??",
+                    "path": path,
+                    "additions": additions,
+                    "deletions": deletions,
+                    "category": categorize_path(path),
+                }
+            )
 
     return changed_files
 
@@ -466,8 +612,7 @@ def main() -> int:
     if args.mode == "range":
         base_ref = resolve_auto_base(repo_root) if args.base == "auto" else args.base
         head_ref = args.head
-        merge_base = run_git(repo_root, ["merge-base", base_ref, head_ref])
-        commit_range = f"{merge_base}..{head_ref}"
+        merge_base, commit_range = resolve_range_commit_spec(repo_root, base_ref, head_ref)
     elif args.mode == "staged":
         base_ref = "INDEX"
         head_ref = "STAGED"
