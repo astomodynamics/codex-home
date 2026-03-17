@@ -18,7 +18,7 @@ behavior against surrounding code and tests, and report only actionable findings
 2. Run the bundled context collector before deep reading:
 
 ```bash
-uv run python docs/skills/pr-review-toolkit/scripts/collect_pr_context.py --base origin/main --head HEAD
+python3 skills/pr-review-toolkit/scripts/collect_pr_context.py --base origin/main --head HEAD
 ```
 
 3. Read `references/review_rubric.md` for severity and evidence standards.

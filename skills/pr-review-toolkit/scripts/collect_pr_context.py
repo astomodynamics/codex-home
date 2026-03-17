@@ -51,9 +51,14 @@ def resolve_auto_base(repo_root: Path) -> str:
 
     current_branch = try_git(repo_root, ["rev-parse", "--abbrev-ref", "HEAD"])
     if current_branch and current_branch != "HEAD":
-        return f"{current_branch}~1"
+        parent_candidate = f"{current_branch}~1"
+        if ref_exists(repo_root, parent_candidate):
+            return parent_candidate
 
-    return "HEAD~1"
+    if ref_exists(repo_root, "HEAD~1"):
+        return "HEAD~1"
+
+    return "HEAD"
 
 
 def parse_name_status(output: str) -> list[dict[str, object]]:
@@ -170,7 +175,8 @@ def matches_test(source_path: str, test_path: str) -> bool:
         return True
 
     parent_name = source.parent.name.lower()
-    return bool(parent_name and parent_name in test_path.lower())
+    test_parts = {part.lower() for part in Path(test_path).parts}
+    return bool(parent_name and parent_name in test_parts)
 
 
 def build_test_signals(changed_files: list[dict[str, object]]) -> tuple[list[str], list[str]]:
@@ -240,13 +246,28 @@ def collect_commits(repo_root: Path, commit_range: str, limit: int) -> list[dict
     return commits
 
 
+def resolve_range_commit_spec(repo_root: Path, base_ref: str, head_ref: str) -> tuple[str, str]:
+    if base_ref == head_ref == "HEAD" and not ref_exists(repo_root, "HEAD~1"):
+        return head_ref, head_ref
+
+    merge_base = run_git(repo_root, ["merge-base", base_ref, head_ref])
+    return merge_base, f"{merge_base}..{head_ref}"
+
+
 def diff_arguments(mode: str, diff_spec: str | None) -> list[str]:
     if mode == "range":
         assert diff_spec is not None
+        if ".." not in diff_spec:
+            return ["diff-tree", "--root", "--no-commit-id", "-r", diff_spec]
         return ["diff", diff_spec]
     if mode == "staged":
         return ["diff", "--cached"]
     return ["diff"]
+
+
+def collect_untracked_files(repo_root: Path) -> list[str]:
+    output = run_git(repo_root, ["ls-files", "--others", "--exclude-standard"], check=False)
+    return [line for line in output.splitlines() if line.strip()]
 
 
 def collect_changed_files(
@@ -269,6 +290,22 @@ def collect_changed_files(
         entry["additions"] = None
         entry["deletions"] = None
         entry["category"] = categorize_path(str(entry["path"]))
+
+    if mode == "working-tree":
+        tracked_paths = {str(entry["path"]) for entry in changed_files}
+        for path in collect_untracked_files(repo_root):
+            if path in tracked_paths:
+                continue
+            changed_files.append(
+                {
+                    "status": "?",
+                    "status_code": "??",
+                    "path": path,
+                    "additions": 0,
+                    "deletions": 0,
+                    "category": categorize_path(path),
+                }
+            )
 
     return changed_files
 
@@ -466,8 +503,7 @@ def main() -> int:
     if args.mode == "range":
         base_ref = resolve_auto_base(repo_root) if args.base == "auto" else args.base
         head_ref = args.head
-        merge_base = run_git(repo_root, ["merge-base", base_ref, head_ref])
-        commit_range = f"{merge_base}..{head_ref}"
+        merge_base, commit_range = resolve_range_commit_spec(repo_root, base_ref, head_ref)
     elif args.mode == "staged":
         base_ref = "INDEX"
         head_ref = "STAGED"
