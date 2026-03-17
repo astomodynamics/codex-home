@@ -10,6 +10,14 @@ import sys
 from collections import Counter
 from pathlib import Path
 
+COMMON_DEFAULT_BRANCH_NAMES = (
+    "main",
+    "master",
+    "trunk",
+    "develop",
+    "development",
+)
+
 
 def run_git(repo_root: Path, args: list[str], check: bool = True) -> str:
     result = subprocess.run(
@@ -40,25 +48,71 @@ def ref_exists(repo_root: Path, ref: str) -> bool:
     return try_git(repo_root, ["rev-parse", "--verify", ref]) is not None
 
 
-def resolve_auto_base(repo_root: Path) -> str:
-    origin_head = try_git(repo_root, ["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"])
-    if origin_head:
-        return origin_head.removeprefix("refs/remotes/")
+def list_refs(repo_root: Path, *prefixes: str) -> list[str]:
+    output = run_git(repo_root, ["for-each-ref", "--format=%(refname:short)", *prefixes], check=False)
+    return [line for line in output.splitlines() if line.strip()]
 
-    for candidate in ("origin/main", "origin/master", "main", "master"):
+
+def dedupe_refs(refs: list[str]) -> list[str]:
+    return list(dict.fromkeys(refs))
+
+
+def resolve_remote_default_branch(repo_root: Path) -> str | None:
+    output = run_git(
+        repo_root,
+        ["for-each-ref", "--format=%(symref:short)", "refs/remotes/*/HEAD"],
+        check=False,
+    )
+    for line in output.splitlines():
+        ref = line.strip()
+        if ref:
+            return ref
+    return None
+
+
+def resolve_single_branch_fallback(repo_root: Path, current_branch: str | None) -> str | None:
+    excluded = {"HEAD"}
+    if current_branch:
+        excluded.add(current_branch)
+        excluded.add(f"origin/{current_branch}")
+
+    candidates = [
+        ref
+        for ref in list_refs(repo_root, "refs/heads", "refs/remotes")
+        if ref not in excluded and not ref.endswith("/HEAD")
+    ]
+    candidates = dedupe_refs(candidates)
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
+def resolve_auto_base(repo_root: Path) -> str:
+    remote_default = resolve_remote_default_branch(repo_root)
+    if remote_default:
+        return remote_default
+
+    configured_default = try_git(repo_root, ["config", "--get", "init.defaultBranch"])
+    configured_candidates: list[str] = []
+    if configured_default:
+        configured_candidates.extend([f"origin/{configured_default}", configured_default])
+
+    named_candidates = configured_candidates + [
+        f"origin/{name}" for name in COMMON_DEFAULT_BRANCH_NAMES
+    ] + list(COMMON_DEFAULT_BRANCH_NAMES)
+    for candidate in dedupe_refs(named_candidates):
         if ref_exists(repo_root, candidate):
             return candidate
 
     current_branch = try_git(repo_root, ["rev-parse", "--abbrev-ref", "HEAD"])
-    if current_branch and current_branch != "HEAD":
-        parent_candidate = f"{current_branch}~1"
-        if ref_exists(repo_root, parent_candidate):
-            return parent_candidate
+    single_branch_fallback = resolve_single_branch_fallback(repo_root, current_branch)
+    if single_branch_fallback:
+        return single_branch_fallback
 
-    if ref_exists(repo_root, "HEAD~1"):
-        return "HEAD~1"
+    if not ref_exists(repo_root, "HEAD~1"):
+        return "HEAD"
 
-    return "HEAD"
+    raise RuntimeError("could not auto-detect a default base branch; pass --base explicitly")
 
 
 def parse_name_status(output: str) -> list[dict[str, object]]:
@@ -158,10 +212,14 @@ def is_public_api_path(path: str) -> bool:
 
 def normalize_test_stem(path: str) -> str:
     stem = Path(path).stem.lower()
-    if stem.startswith("test_"):
-        stem = stem[5:]
-    if stem.endswith("_test"):
-        stem = stem[:-5]
+    for prefix in ("test_", "spec_"):
+        if stem.startswith(prefix):
+            stem = stem[len(prefix) :]
+            break
+    for suffix in ("_test", "_spec", ".test", ".spec", "-test", "-spec"):
+        if stem.endswith(suffix):
+            stem = stem[: -len(suffix)]
+            break
     return stem
 
 
@@ -169,9 +227,7 @@ def matches_test(source_path: str, test_path: str) -> bool:
     source = Path(source_path)
     source_stem = source.stem.lower()
     test_stem = normalize_test_stem(test_path)
-    if source_stem and (
-        source_stem == test_stem or source_stem in test_stem or test_stem in source_stem
-    ):
+    if source_stem and source_stem == test_stem:
         return True
 
     parent_name = source.parent.name.lower()
@@ -270,6 +326,24 @@ def collect_untracked_files(repo_root: Path) -> list[str]:
     return [line for line in output.splitlines() if line.strip()]
 
 
+def count_text_lines(contents: bytes) -> int:
+    if not contents:
+        return 0
+    return contents.count(b"\n") + (0 if contents.endswith(b"\n") else 1)
+
+
+def collect_untracked_numstat(repo_root: Path, path: str) -> tuple[int | None, int | None]:
+    file_path = repo_root / path
+    try:
+        contents = file_path.read_bytes()
+    except OSError:
+        return None, None
+
+    if b"\0" in contents:
+        return None, None
+    return count_text_lines(contents), 0
+
+
 def collect_changed_files(
     repo_root: Path,
     mode: str,
@@ -296,13 +370,14 @@ def collect_changed_files(
         for path in collect_untracked_files(repo_root):
             if path in tracked_paths:
                 continue
+            additions, deletions = collect_untracked_numstat(repo_root, path)
             changed_files.append(
                 {
                     "status": "?",
                     "status_code": "??",
                     "path": path,
-                    "additions": 0,
-                    "deletions": 0,
+                    "additions": additions,
+                    "deletions": deletions,
                     "category": categorize_path(path),
                 }
             )
